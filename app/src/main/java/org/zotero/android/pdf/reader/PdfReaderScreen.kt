@@ -174,7 +174,12 @@ internal fun PdfReaderScreen(
         CustomScaffoldM3(
             modifier = Modifier.pointerInteropFilter {
                 when (it.action) {
-                    MotionEvent.ACTION_DOWN -> viewModel.restartDisableForceScreenOnTimer()
+                    MotionEvent.ACTION_DOWN -> {
+                        // Only restart timer for finger touches, bypass for stylus to reduce input overhead
+                        if (it.getToolType(0) != MotionEvent.TOOL_TYPE_STYLUS) {
+                            viewModel.restartDisableForceScreenOnTimer()
+                        }
+                    }
                 }
                 false
             },

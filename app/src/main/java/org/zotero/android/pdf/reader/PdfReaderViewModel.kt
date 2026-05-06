@@ -2222,6 +2222,7 @@ class PdfReaderViewModel @Inject constructor(
             .disableDefaultToolbar()
             .hideDocumentTitleOverlay()
             .enableStylusOnDetection(true)
+            .setMultithreadedRenderingEnabled(true)
             .hideUserInterfaceWhenCreatingAnnotations(false)
             .setUserInterfaceViewMode(UserInterfaceViewMode.USER_INTERFACE_VIEW_MODE_MANUAL)
             .build()
