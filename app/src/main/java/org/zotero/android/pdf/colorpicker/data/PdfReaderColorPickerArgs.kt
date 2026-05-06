@@ -6,4 +6,6 @@ data class PdfReaderColorPickerArgs(
     val tool: AnnotationTool,
     val colorHex: String? = null,
     val size: Float? = null,
+    val sizeRangeStart: Float = 0.5f,
+    val sizeRangeEnd: Float = 25f,
 )

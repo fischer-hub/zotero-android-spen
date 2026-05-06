@@ -40,7 +40,7 @@ internal fun PdfAnnotationSizeSelector(
                 activeTrackColor = MaterialTheme.colorScheme.primary,
                 thumbColor = MaterialTheme.colorScheme.primary,
             ),
-            valueRange = 0.5f..25f
+            valueRange = 0.1f..25f
         )
         Text(
             modifier = Modifier.padding(start = 10.dp),

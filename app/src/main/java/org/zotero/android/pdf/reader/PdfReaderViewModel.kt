@@ -232,7 +232,8 @@ class PdfReaderViewModel @Inject constructor(
     private lateinit var rawDocument: PdfDocument
     var comments = mutableMapOf<String, String>()
     private val onAnnotationSearchStateFlow = MutableStateFlow("")
-    private val onAnnotationChangedDebouncerFlow = MutableStateFlow<Triple<Int, List<String>, Annotation>?>(null)
+    private val onAnnotationChangedDebouncerFlow = MutableStateFlow<PendingAnnotationChange?>(null)
+    private val onInkAnnotationChangedDebouncerFlow = MutableStateFlow<PendingAnnotationChange?>(null)
     private val onOutlineSearchStateFlow = MutableStateFlow("")
     private val onStorePageFlow = MutableStateFlow(0)
     private val onCommentChangeFlow = MutableStateFlow<Pair<String, String>?>(null)
@@ -253,6 +254,13 @@ class PdfReaderViewModel @Inject constructor(
     private var toolHistory = mutableListOf<AnnotationTool>()
 
     private lateinit var searchResultHighlighter: SearchResultHighlighter
+
+    private data class PendingAnnotationChange(
+        val changes: List<String>,
+        val annotation: Annotation,
+        val notifyDocument: Boolean,
+        val id: Int = Random.nextInt(),
+    )
 
     private var disableForceScreenOnTimer: Timer? = null
 
@@ -1003,11 +1011,29 @@ class PdfReaderViewModel @Inject constructor(
     }
 
     private fun setupAnnotationChangedDebouncerFlow() {
-        onAnnotationChangedDebouncerFlow
-            .debounce(200)
-            .map { pair ->
-                if (pair != null) {
-                    change(annotation = pair.third, pair.second)
+        observeAnnotationChangedDebouncerFlow(
+            flow = onAnnotationChangedDebouncerFlow,
+            timeoutMillis = 200
+        )
+        observeAnnotationChangedDebouncerFlow(
+            flow = onInkAnnotationChangedDebouncerFlow,
+            timeoutMillis = 650
+        )
+    }
+
+    private fun observeAnnotationChangedDebouncerFlow(
+        flow: MutableStateFlow<PendingAnnotationChange?>,
+        timeoutMillis: Long
+    ) {
+        flow
+            .debounce(timeoutMillis)
+            .map { pendingChange ->
+                if (pendingChange != null) {
+                    change(
+                        annotation = pendingChange.annotation,
+                        changes = pendingChange.changes,
+                        notifyDocument = pendingChange.notifyDocument
+                    )
                 }
             }
             .launchIn(viewModelScope)
@@ -1032,7 +1058,8 @@ class PdfReaderViewModel @Inject constructor(
                 processAnnotationObserving(
                     annotation = annotation,
                     changes = emptyList(),
-                    pdfReaderNotification = PdfReaderNotification.PSPDFAnnotationChanged
+                    pdfReaderNotification = PdfReaderNotification.PSPDFAnnotationChanged,
+                    notifyDocumentAfterChange = false
                 )
                 lastSelectedAnnotation = annotation
             }
@@ -1088,7 +1115,11 @@ class PdfReaderViewModel @Inject constructor(
         return false
     }
 
-    private fun change(annotation: Annotation, changes: List<String>) {
+    private fun change(
+        annotation: Annotation,
+        changes: List<String>,
+        notifyDocument: Boolean = true,
+    ) {
         if (changes.isEmpty()) {
             return
         }
@@ -1241,7 +1272,9 @@ class PdfReaderViewModel @Inject constructor(
         }
         dbWrapperMain.realmDbStorage.perform(requests)
 
-        pdfFragment.notifyAnnotationHasChanged(annotation)
+        if (notifyDocument) {
+            pdfFragment.notifyAnnotationHasChanged(annotation)
+        }
         //TODO
     }
 
@@ -1250,6 +1283,7 @@ class PdfReaderViewModel @Inject constructor(
         changes: List<String>,
         pdfReaderNotification: PdfReaderNotification,
         ignoreDebouncer: Boolean = false,
+        notifyDocumentAfterChange: Boolean = true,
     ) {
 
         when (pdfReaderNotification) {
@@ -1271,13 +1305,17 @@ class PdfReaderViewModel @Inject constructor(
 //                        if (changes.contains("rotation") || freeTextAnnotation.rotation != 0) {
 
                             if (ignoreDebouncer) {
-                                change(annotation = annotation, adjustedAnnotations)
+                                change(
+                                    annotation = annotation,
+                                    changes = adjustedAnnotations,
+                                    notifyDocument = notifyDocumentAfterChange
+                                )
                             } else {
                                 onAnnotationChangedDebouncerFlow.tryEmit(
-                                    Triple(
-                                        Random.nextInt(),
-                                        adjustedAnnotations,
-                                        annotation
+                                    PendingAnnotationChange(
+                                        changes = adjustedAnnotations,
+                                        annotation = annotation,
+                                        notifyDocument = notifyDocumentAfterChange
                                     )
                                 )
                             }
@@ -1289,7 +1327,11 @@ class PdfReaderViewModel @Inject constructor(
 //                            change(annotation = annotation, changes = changes)
 //                        }
                         } else {
-                            change(annotation = annotation, changes = adjustedAnnotations)
+                            change(
+                                annotation = annotation,
+                                changes = adjustedAnnotations,
+                                notifyDocument = notifyDocumentAfterChange
+                            )
                         }
                     }
                     else -> {
@@ -1302,17 +1344,18 @@ class PdfReaderViewModel @Inject constructor(
                             ).toMutableList()
                         listOfChanges.addAll(changes)
                         if (annotation is InkAnnotation && annotation.key != null && !ignoreDebouncer) {
-                            onAnnotationChangedDebouncerFlow.tryEmit(
-                                Triple(
-                                    Random.nextInt(),
-                                    listOfChanges,
-                                    annotation
+                            onInkAnnotationChangedDebouncerFlow.tryEmit(
+                                PendingAnnotationChange(
+                                    changes = listOfChanges,
+                                    annotation = annotation,
+                                    notifyDocument = notifyDocumentAfterChange
                                 )
                             )
                         } else {
                             change(
                                 annotation = annotation,
-                                changes = listOfChanges
+                                changes = listOfChanges,
+                                notifyDocument = notifyDocumentAfterChange
                             )
                         }
                     }
@@ -2495,6 +2538,8 @@ class PdfReaderViewModel @Inject constructor(
             tool = tool,
             size = size,
             colorHex = colorHex,
+            sizeRangeStart = if (tool == AnnotationTool.INK) 0.1f else 0.5f,
+            sizeRangeEnd = 25f,
         )
         triggerEffect(PdfReaderViewEffect.ShowPdfColorPicker)
     }
@@ -2857,8 +2902,7 @@ class PdfReaderViewModel @Inject constructor(
         for (annotation in finalAnnotations) {
             if (annotation.key == null) {
                 annotation.creator = viewState.displayName
-                annotation.customData =
-                    JSONObject().put(AnnotationsConfig.keyKey, KeyGenerator.newKey())
+                annotation.key = KeyGenerator.newKey()
             }
         }
 

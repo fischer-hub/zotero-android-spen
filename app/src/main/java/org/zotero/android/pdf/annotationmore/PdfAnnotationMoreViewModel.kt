@@ -102,7 +102,7 @@ internal class PdfAnnotationMoreViewModel @Inject constructor(
 
     fun onSizeChanged(newSize: Float) {
         updateState {
-            copy(lineWidth = newSize)
+            copy(lineWidth = newSize.coerceIn(0.1f, 25f))
         }
     }
 

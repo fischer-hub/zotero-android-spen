@@ -143,13 +143,14 @@ internal class PdfAnnotationViewModel @Inject constructor(
     }
 
     fun onSizeChanged(newSize: Float) {
+        val size = newSize.coerceIn(0.1f, 25f)
         updateState {
-            copy(size = newSize)
+            copy(size = size)
         }
         EventBus.getDefault().post(
             PdfAnnotationSizeResult(
                 key = viewState.annotation!!.key,
-                size = newSize
+                size = size
             )
         )
     }

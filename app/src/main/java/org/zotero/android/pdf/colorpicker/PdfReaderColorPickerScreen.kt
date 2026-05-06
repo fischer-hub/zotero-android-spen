@@ -84,7 +84,7 @@ internal fun PdfReaderColorPickerScreen(
                                 activeTrackColor = MaterialTheme.colorScheme.primary,
                                 thumbColor = MaterialTheme.colorScheme.primary,
                             ),
-                            valueRange = 0.5f..25f
+                            valueRange = viewState.sizeRangeStart..viewState.sizeRangeEnd
                         )
                         Text(
                             modifier = Modifier.padding(horizontal = 10.dp),
@@ -140,5 +140,4 @@ private fun FilterCircle(hex: String, isSelected: Boolean, onClick: () -> Unit) 
         }
     })
 }
-
 

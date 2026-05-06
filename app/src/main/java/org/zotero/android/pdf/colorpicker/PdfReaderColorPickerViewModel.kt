@@ -58,7 +58,12 @@ internal class PdfReaderColorPickerViewModel @Inject constructor(
             updateState {
                 copy(
                     selectedColor = selectedColor,
-                    size = colorPickerArgs.size,
+                    size = colorPickerArgs.size?.coerceIn(
+                        colorPickerArgs.sizeRangeStart,
+                        colorPickerArgs.sizeRangeEnd
+                    ),
+                    sizeRangeStart = colorPickerArgs.sizeRangeStart,
+                    sizeRangeEnd = colorPickerArgs.sizeRangeEnd,
                 )
             }
         }
@@ -106,7 +111,7 @@ internal class PdfReaderColorPickerViewModel @Inject constructor(
 
     fun onSizeChanged(newSize: Float) {
         updateState {
-            copy(size = newSize)
+            copy(size = newSize.coerceIn(viewState.sizeRangeStart, viewState.sizeRangeEnd))
         }
         updateQueueResult()
 
@@ -117,6 +122,8 @@ internal class PdfReaderColorPickerViewModel @Inject constructor(
 internal data class PdfReaderColorPickerViewState(
     val selectedColor: String? = null,
     val size: Float? = null,
+    val sizeRangeStart: Float = 0.5f,
+    val sizeRangeEnd: Float = 25f,
     val colors: List<String> = emptyList(),
     val isDark: Boolean = false,
 ) : ViewState
