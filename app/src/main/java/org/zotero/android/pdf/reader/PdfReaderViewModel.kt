@@ -232,7 +232,7 @@ class PdfReaderViewModel @Inject constructor(
     private lateinit var rawDocument: PdfDocument
     var comments = mutableMapOf<String, String>()
     private val onAnnotationSearchStateFlow = MutableStateFlow("")
-    private val onAnnotationChangedDebouncerFlow = MutableStateFlow<Triple<Int, List<String>, FreeTextAnnotation>?>(null)
+    private val onAnnotationChangedDebouncerFlow = MutableStateFlow<Triple<Int, List<String>, Annotation>?>(null)
     private val onOutlineSearchStateFlow = MutableStateFlow("")
     private val onStorePageFlow = MutableStateFlow(0)
     private val onCommentChangeFlow = MutableStateFlow<Pair<String, String>?>(null)
@@ -246,7 +246,7 @@ class PdfReaderViewModel @Inject constructor(
 
     override var toolColors: MutableMap<AnnotationTool, String> = mutableMapOf()
     var changedColorForTool: AnnotationTool? = null
-    var activeLineWidth: Float = 0.0f
+    override var activeLineWidth: Float = 0.0f
     var activeEraserSize: Float = 0.0f
     var activeFontSize: Float = 0.0f
 
@@ -1301,10 +1301,20 @@ class PdfReaderViewModel @Inject constructor(
                                 )
                             ).toMutableList()
                         listOfChanges.addAll(changes)
-                        change(
-                            annotation = annotation,
-                            changes = listOfChanges
-                        )
+                        if (annotation is InkAnnotation && annotation.key != null && !ignoreDebouncer) {
+                            onAnnotationChangedDebouncerFlow.tryEmit(
+                                Triple(
+                                    Random.nextInt(),
+                                    listOfChanges,
+                                    annotation
+                                )
+                            )
+                        } else {
+                            change(
+                                annotation = annotation,
+                                changes = listOfChanges
+                            )
+                        }
                     }
                 }
             }

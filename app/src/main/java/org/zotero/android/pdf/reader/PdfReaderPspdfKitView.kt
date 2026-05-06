@@ -1,7 +1,9 @@
 package org.zotero.android.pdf.reader
 
+import android.content.Context
 import android.content.res.Resources
 import android.util.TypedValue
+import android.view.MotionEvent
 import android.widget.FrameLayout
 import androidx.activity.compose.LocalActivity
 import androidx.appcompat.app.AppCompatActivity
@@ -18,7 +20,8 @@ import timber.log.Timber
 
 @Composable
 fun PdfReaderPspdfKitView(
-    vMInterface: PdfReaderVMInterface
+    vMInterface: PdfReaderVMInterface,
+    onMotionEvent: (MotionEvent) -> Unit = {},
 ) {
     val activity = LocalActivity.current as? AppCompatActivity ?: return
     val annotationMaxSideSize = annotationMaxSideSize()
@@ -29,7 +32,9 @@ fun PdfReaderPspdfKitView(
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
-            val frameLayout = FrameLayout(context)
+            val frameLayout = MotionObservingFrameLayout(context).apply {
+                this.onMotionEvent = onMotionEvent
+            }
 
             val containerId = R.id.container
             val fragmentContainerView = FragmentContainerView(context).apply {
@@ -46,9 +51,19 @@ fun PdfReaderPspdfKitView(
             )
             frameLayout
         },
-        update = { _ ->
+        update = { view ->
+            view.onMotionEvent = onMotionEvent
         }
     )
+}
+
+private class MotionObservingFrameLayout(context: Context) : FrameLayout(context) {
+    var onMotionEvent: (MotionEvent) -> Unit = {}
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        onMotionEvent(event)
+        return super.dispatchTouchEvent(event)
+    }
 }
 
 @Composable

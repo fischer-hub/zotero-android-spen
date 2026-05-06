@@ -1,7 +1,10 @@
 package org.zotero.android.pdf.reader
 
+import android.graphics.Color as AndroidColor
+import android.view.MotionEvent
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.rememberSplineBasedDecay
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.AnchoredDraggableState
 import androidx.compose.foundation.gestures.DraggableAnchors
 import androidx.compose.foundation.layout.Box
@@ -14,13 +17,19 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import com.pspdfkit.ui.special_mode.controller.AnnotationTool
 import org.zotero.android.pdf.reader.toolbar.PdfReaderAnnotationCreationToolbar
 import org.zotero.android.screens.allitems.ExportingAnnotatedPdfLoadingIndicator
 import org.zotero.android.screens.allitems.GeneratingBibliographyLoadingIndicator
+import kotlin.math.hypot
+import kotlin.math.min
 
 
 @Composable
@@ -58,6 +67,19 @@ internal fun PdfReaderPspdfKitBox(
         )
     }
     val rightTargetAreaXOffset = with(density) { 92.dp.toPx() }
+    val predictionState = remember { StylusPredictionState() }
+    val predictionMaxDistance = with(density) { 48.dp.toPx() }
+    val predictedTail = predictionState.predictedTail
+    val predictionLineWidth = with(density) {
+        maxOf(1.5.dp.toPx(), vMInterface.activeLineWidth.dp.toPx())
+    }
+    val predictionColor = remember(vMInterface.toolColors[AnnotationTool.INK]) {
+        vMInterface.toolColors[AnnotationTool.INK]
+            ?.let { hex ->
+                runCatching { Color(AndroidColor.parseColor(hex)) }.getOrNull()
+            }
+            ?: Color.Black
+    }.copy(alpha = 0.55f)
 
     Box(
         modifier = Modifier
@@ -75,7 +97,30 @@ internal fun PdfReaderPspdfKitBox(
                 )
             }
     ) {
-        PdfReaderPspdfKitView(vMInterface = vMInterface)
+        PdfReaderPspdfKitView(
+            vMInterface = vMInterface,
+            onMotionEvent = { event ->
+                if (vMInterface.activeAnnotationTool == AnnotationTool.INK) {
+                    predictionState.onMotionEvent(
+                        event = event,
+                        maxPredictionDistance = predictionMaxDistance
+                    )
+                } else {
+                    predictionState.clear()
+                }
+            }
+        )
+        if (predictedTail != null) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawLine(
+                    color = predictionColor,
+                    start = predictedTail.start,
+                    end = predictedTail.end,
+                    strokeWidth = predictionLineWidth,
+                    cap = StrokeCap.Round
+                )
+            }
+        }
         if (viewState.showCreationToolbar) {
             PdfReaderAnnotationCreationToolbar(
                 viewState = viewState,
@@ -99,3 +144,115 @@ enum class DragAnchors(val fraction: Float) {
     End(1f),
 }
 
+private class StylusPredictionState {
+    var predictedTail: PredictedTail? by mutableStateOf(null)
+        private set
+
+    private var pointerId: Int? = null
+    private var lastSample: TimedPoint? = null
+
+    fun onMotionEvent(event: MotionEvent, maxPredictionDistance: Float) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                val pointerIndex = event.stylusPointerIndex() ?: return clear()
+                pointerId = event.getPointerId(pointerIndex)
+                lastSample = TimedPoint(
+                    point = Offset(event.getX(pointerIndex), event.getY(pointerIndex)),
+                    eventTime = event.eventTime
+                )
+                predictedTail = null
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                val pointerIndex = pointerId
+                    ?.let { event.findPointerIndex(it) }
+                    ?.takeIf { it >= 0 }
+                    ?: event.stylusPointerIndex()
+                    ?: return clear()
+
+                for (historyIndex in 0 until event.historySize) {
+                    updatePrediction(
+                        point = Offset(
+                            event.getHistoricalX(pointerIndex, historyIndex),
+                            event.getHistoricalY(pointerIndex, historyIndex)
+                        ),
+                        eventTime = event.getHistoricalEventTime(historyIndex),
+                        maxPredictionDistance = maxPredictionDistance
+                    )
+                }
+                updatePrediction(
+                    point = Offset(event.getX(pointerIndex), event.getY(pointerIndex)),
+                    eventTime = event.eventTime,
+                    maxPredictionDistance = maxPredictionDistance
+                )
+            }
+
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_POINTER_UP,
+            MotionEvent.ACTION_CANCEL -> {
+                val activePointerId = pointerId
+                if (activePointerId == null || event.getPointerId(event.actionIndex) == activePointerId) {
+                    clear()
+                }
+            }
+        }
+    }
+
+    fun clear() {
+        pointerId = null
+        lastSample = null
+        predictedTail = null
+    }
+
+    private fun updatePrediction(point: Offset, eventTime: Long, maxPredictionDistance: Float) {
+        val previous = lastSample
+        lastSample = TimedPoint(point = point, eventTime = eventTime)
+
+        if (previous == null) {
+            predictedTail = null
+            return
+        }
+
+        val deltaTime = (eventTime - previous.eventTime).toFloat()
+        if (deltaTime <= 0f || deltaTime > 64f) {
+            predictedTail = null
+            return
+        }
+
+        val delta = point - previous.point
+        val distance = hypot(delta.x, delta.y)
+        if (distance < 0.5f) {
+            predictedTail = null
+            return
+        }
+
+        val predictedDistance = min(distance / deltaTime * PREDICTION_MS, maxPredictionDistance)
+        val predictedPoint = point + delta / distance * predictedDistance
+        predictedTail = PredictedTail(start = point, end = predictedPoint)
+    }
+
+    private fun MotionEvent.stylusPointerIndex(): Int? {
+        for (index in 0 until pointerCount) {
+            when (getToolType(index)) {
+                MotionEvent.TOOL_TYPE_STYLUS,
+                MotionEvent.TOOL_TYPE_ERASER -> return index
+            }
+        }
+        return null
+    }
+
+    private companion object {
+        const val PREDICTION_MS = 24f
+    }
+}
+
+private data class TimedPoint(
+    val point: Offset,
+    val eventTime: Long,
+)
+
+private data class PredictedTail(
+    val start: Offset,
+    val end: Offset,
+)

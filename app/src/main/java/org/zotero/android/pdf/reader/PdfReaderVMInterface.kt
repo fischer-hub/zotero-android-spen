@@ -15,6 +15,7 @@ interface PdfReaderVMInterface {
     val annotationPreviewMemoryCache: AnnotationPreviewMemoryCache
     val thumbnailPreviewMemoryCache: ThumbnailPreviewMemoryCache
     val activeAnnotationTool: AnnotationTool?
+    val activeLineWidth: Float
     var toolColors: MutableMap<AnnotationTool, String>
 
     fun init(
