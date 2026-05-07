@@ -11,6 +11,7 @@ import org.zotero.android.screens.citbibexport.data.CitBibExportOutputMethod
 import org.zotero.android.screens.citbibexport.data.CitBibExportOutputMode
 import org.zotero.android.screens.htmlepub.settings.data.HtmlEpubSettings
 import org.zotero.android.screens.itemdetails.data.ItemDetailCreator
+import org.zotero.android.screens.share.data.PdfReplacementTarget
 import org.zotero.android.webdav.data.WebDavScheme
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -54,6 +55,7 @@ open class Defaults @Inject constructor(
     private val exportLocaleId = "exportLocaleId"
     private val quickCopyAsHtml = "quickCopyAsHtml"
     private val htmlEpubSettings = "htmlEpubSettings"
+    private val lastPdfReplacementTarget = "lastPdfReplacementTarget"
 
     private val exportOutputMode = "exportOutputMode"
     private val exportOutputMethod = "exportOutputMethod"
@@ -252,6 +254,24 @@ open class Defaults @Inject constructor(
     ) {
         val json = dataMarshaller.marshal(pdfSettings)
         sharedPreferences.edit { putString(this@Defaults.pdfSettings, json) }
+    }
+
+    fun setLastPdfReplacementTarget(target: PdfReplacementTarget) {
+        val json = dataMarshaller.marshal(target)
+        sharedPreferences.edit { putString(lastPdfReplacementTarget, json) }
+    }
+
+    fun getLastPdfReplacementTarget(): PdfReplacementTarget? {
+        val json = sharedPreferences.getString(lastPdfReplacementTarget, null) ?: return null
+        return try {
+            dataMarshaller.unmarshal<PdfReplacementTarget>(json)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun clearLastPdfReplacementTarget() {
+        sharedPreferences.edit { remove(lastPdfReplacementTarget) }
     }
 
     fun showCollectionItemCounts(): Boolean {

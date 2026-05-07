@@ -129,7 +129,6 @@ internal class DashboardActivity : BaseActivity() {
             share.putExtra(Intent.EXTRA_STREAM, resultUri)
             showAppChooserExcludingZoteroApp(share)
         }
-
         val onExportHtml: (file: File) -> Unit = { file ->
             val fileProviderAuthority = BuildConfig.APPLICATION_ID + ".provider"
             val resultUri = FileProvider.getUriForFile(this, fileProviderAuthority, file)
@@ -190,7 +189,6 @@ internal class DashboardActivity : BaseActivity() {
         }
 
     }
-
     private fun showAppChooserExcludingZoteroApp(intent: Intent) {
         val noAppFoundMessage = "No app found to open this file"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -241,4 +239,3 @@ internal class DashboardActivity : BaseActivity() {
         }
     }
 }
-

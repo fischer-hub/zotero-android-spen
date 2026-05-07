@@ -1,17 +1,20 @@
 package org.zotero.android.pdf.reader
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.RectF
+import android.os.Handler
+import android.os.Looper
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.View
 import android.graphics.Canvas as AndroidCanvas
 import android.graphics.Color as AndroidColor
 import android.graphics.Paint as AndroidPaint
 import android.graphics.Path as AndroidPath
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.rememberSplineBasedDecay
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.AnchoredDraggableState
 import androidx.compose.foundation.gestures.DraggableAnchors
 import androidx.compose.foundation.layout.Box
@@ -26,11 +29,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
@@ -80,6 +78,7 @@ internal fun PdfReaderPspdfKitBox(
     }
     val rightTargetAreaXOffset = with(density) { 92.dp.toPx() }
     val pressureInkState = remember { PressureInkStrokeState() }
+    val inkOverlayController = remember { PressureInkOverlayController() }
     val stylusButtonUndoState = remember { StylusButtonUndoState() }
     val predictionMaxDistance = with(density) { 38.dp.toPx() }
     val bakedInkBaseWidth = with(density) {
@@ -92,14 +91,8 @@ internal fun PdfReaderPspdfKitBox(
             }
             ?: AndroidColor.BLACK
     }
-    val inkColor = remember(inkColorInt) { Color(inkColorInt) }
-    val liveStrokeSamples = pressureInkState.liveSamples
-    val livePressureProfile = pressureInkState.livePressureProfile
-    val committedPreviewStrokes = pressureInkState.committedPreviewStrokes
-    val predictedSample = pressureInkState.predictedSample
-    val hasLiveStroke = liveStrokeSamples.isNotEmpty()
     val undoFromStylusButton = {
-        pressureInkState.clear()
+        pressureInkState.clear(inkOverlayController)
         if (vMInterface.canUndo()) {
             vMInterface.onUndoClick()
         }
@@ -123,6 +116,7 @@ internal fun PdfReaderPspdfKitBox(
     ) {
         PdfReaderPspdfKitView(
             vMInterface = vMInterface,
+            inkOverlayController = inkOverlayController,
             onMotionEvent = { event ->
                 if (
                     stylusButtonUndoState.onMotionEvent(
@@ -137,10 +131,11 @@ internal fun PdfReaderPspdfKitBox(
                         baseStrokeWidthPx = bakedInkBaseWidth,
                         predictionMaxDistancePx = predictionMaxDistance,
                         color = inkColorInt,
+                        inkOverlayController = inkOverlayController,
                         onCommit = vMInterface::addBakedInkStroke
                     )
                 } else {
-                    pressureInkState.clear()
+                    pressureInkState.cancelActiveStroke(inkOverlayController)
                     false
                 }
             },
@@ -151,35 +146,6 @@ internal fun PdfReaderPspdfKitBox(
                 )
             }
         )
-        if (committedPreviewStrokes.isNotEmpty() || hasLiveStroke) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                committedPreviewStrokes.forEach { previewStroke ->
-                    drawPressureStroke(
-                        samples = previewStroke.samples,
-                        baseStrokeWidthPx = bakedInkBaseWidth,
-                        color = inkColor,
-                        pressureProfile = previewStroke.pressureProfile
-                    )
-                }
-                if (hasLiveStroke) {
-                    drawPressureStroke(
-                        samples = liveStrokeSamples,
-                        baseStrokeWidthPx = bakedInkBaseWidth,
-                        color = inkColor,
-                        pressureProfile = livePressureProfile
-                    )
-                    if (predictedSample != null) {
-                        drawPredictedPressureStroke(
-                            samples = liveStrokeSamples,
-                            predictedSample = predictedSample,
-                            baseStrokeWidthPx = bakedInkBaseWidth,
-                            color = inkColor.copy(alpha = 0.38f),
-                            pressureProfile = livePressureProfile
-                        )
-                    }
-                }
-            }
-        }
         if (viewState.showCreationToolbar) {
             PdfReaderAnnotationCreationToolbar(
                 viewState = viewState,
@@ -278,26 +244,21 @@ private class StylusButtonUndoState {
 }
 
 private class PressureInkStrokeState {
-    var liveSamples: List<PressureSample> by mutableStateOf(emptyList())
-        private set
-    var livePressureProfile: PressureProfile by mutableStateOf(PressureProfile.empty())
-        private set
-    var committedPreviewStrokes: List<CommittedPressureStroke> by mutableStateOf(emptyList())
-        private set
-    var predictedSample: PressureSample? by mutableStateOf(null)
-        private set
-
     private var pointerId: Int? = null
     private val samples = mutableListOf<PressureSample>()
     private var commitGeneration = 0
     private var minStrokePressure = 1f
     private var maxStrokePressure = 0f
+    private val pendingCommitHandler = Handler(Looper.getMainLooper())
+    private val pendingCommits = mutableListOf<PendingPressureInkCommit>()
+    private val flushPendingCommitsRunnable = Runnable { flushPendingCommits() }
 
     fun onMotionEvent(
         event: MotionEvent,
         baseStrokeWidthPx: Float,
         predictionMaxDistancePx: Float,
         color: Int,
+        inkOverlayController: PressureInkOverlayController,
         onCommit: (Bitmap, RectF, () -> Unit) -> Unit
     ): Boolean {
         return when (event.actionMasked) {
@@ -307,10 +268,16 @@ private class PressureInkStrokeState {
                     true
                 } else {
                     val pointerIndex = event.stylusPointerIndex() ?: return false
+                    postponePendingCommits()
                     pointerId = event.getPointerId(pointerIndex)
                     resetActiveSamples()
                     addSample(event.currentPressureSample(pointerIndex))
-                    publishLiveStroke(predictionMaxDistancePx)
+                    publishLiveStroke(
+                        baseStrokeWidthPx = baseStrokeWidthPx,
+                        maxPredictionDistancePx = predictionMaxDistancePx,
+                        color = color,
+                        inkOverlayController = inkOverlayController
+                    )
                     true
                 }
             }
@@ -318,7 +285,12 @@ private class PressureInkStrokeState {
             MotionEvent.ACTION_MOVE -> {
                 val pointerIndex = pointerIndex(event) ?: return pointerId != null
                 addSamples(event = event, pointerIndex = pointerIndex)
-                publishLiveStroke(predictionMaxDistancePx)
+                publishLiveStroke(
+                    baseStrokeWidthPx = baseStrokeWidthPx,
+                    maxPredictionDistancePx = predictionMaxDistancePx,
+                    color = color,
+                    inkOverlayController = inkOverlayController
+                )
                 true
             }
 
@@ -335,12 +307,10 @@ private class PressureInkStrokeState {
                 pointerIndex(event)?.let { pointerIndex ->
                     addSamples(event = event, pointerIndex = pointerIndex)
                 }
-                livePressureProfile = currentPressureProfile()
-                liveSamples = samples.toList()
-                predictedSample = null
                 commitStroke(
                     baseStrokeWidthPx = baseStrokeWidthPx,
                     color = color,
+                    inkOverlayController = inkOverlayController,
                     onCommit = onCommit
                 )
                 true
@@ -348,7 +318,7 @@ private class PressureInkStrokeState {
 
             MotionEvent.ACTION_CANCEL -> {
                 val wasDrawing = pointerId != null
-                clearActiveStroke()
+                clearActiveStroke(inkOverlayController)
                 wasDrawing
             }
 
@@ -356,17 +326,21 @@ private class PressureInkStrokeState {
         }
     }
 
-    fun clear() {
-        clearActiveStroke()
-        committedPreviewStrokes = emptyList()
+    fun clear(inkOverlayController: PressureInkOverlayController) {
+        pendingCommitHandler.removeCallbacks(flushPendingCommitsRunnable)
+        pendingCommits.clear()
+        clearActiveStroke(inkOverlayController)
+        inkOverlayController.clear()
     }
 
-    private fun clearActiveStroke() {
+    fun cancelActiveStroke(inkOverlayController: PressureInkOverlayController) {
+        clearActiveStroke(inkOverlayController)
+    }
+
+    private fun clearActiveStroke(inkOverlayController: PressureInkOverlayController) {
         pointerId = null
         resetActiveSamples()
-        liveSamples = emptyList()
-        livePressureProfile = PressureProfile.empty()
-        predictedSample = null
+        inkOverlayController.clearLiveStroke()
     }
 
     private fun resetActiveSamples() {
@@ -408,10 +382,19 @@ private class PressureInkStrokeState {
         samples.add(sample.copy(pressure = sanitizedPressure))
     }
 
-    private fun publishLiveStroke(maxPredictionDistancePx: Float) {
-        livePressureProfile = currentPressureProfile()
-        liveSamples = samples.toList()
-        predictedSample = calculatePrediction(maxPredictionDistancePx)
+    private fun publishLiveStroke(
+        baseStrokeWidthPx: Float,
+        maxPredictionDistancePx: Float,
+        color: Int,
+        inkOverlayController: PressureInkOverlayController
+    ) {
+        inkOverlayController.setLiveStroke(
+            samples = samples.toList(),
+            pressureProfile = currentPressureProfile(),
+            predictedSample = calculatePrediction(maxPredictionDistancePx),
+            baseStrokeWidthPx = baseStrokeWidthPx,
+            color = color
+        )
     }
 
     private fun currentPressureProfile(): PressureProfile {
@@ -425,45 +408,77 @@ private class PressureInkStrokeState {
     private fun commitStroke(
         baseStrokeWidthPx: Float,
         color: Int,
+        inkOverlayController: PressureInkOverlayController,
         onCommit: (Bitmap, RectF, () -> Unit) -> Unit
     ) {
         val strokeSamples = samples.toList()
         val strokePressureProfile = currentPressureProfile()
         if (strokeSamples.isEmpty()) {
-            clearActiveStroke()
-            return
-        }
-
-        val viewBounds = strokeBounds(
-            samples = strokeSamples,
-            baseStrokeWidthPx = baseStrokeWidthPx
-        )
-        val bitmap = renderStrokeBitmap(
-            samples = strokeSamples,
-            viewBounds = viewBounds,
-            baseStrokeWidthPx = baseStrokeWidthPx,
-            color = color
-        ) ?: run {
-            clearActiveStroke()
+            clearActiveStroke(inkOverlayController)
             return
         }
 
         val committedGeneration = ++commitGeneration
-        committedPreviewStrokes = committedPreviewStrokes +
-                CommittedPressureStroke(
-                    id = committedGeneration,
-                    samples = strokeSamples,
-                    pressureProfile = strokePressureProfile
-                )
-        clearActiveStroke()
-        onCommit(bitmap, viewBounds) {
-            clearCommittedPreview(committedGeneration)
-        }
+        inkOverlayController.addCommittedPreview(
+            CommittedPressureStroke(
+                id = committedGeneration,
+                samples = strokeSamples,
+                pressureProfile = strokePressureProfile,
+                baseStrokeWidthPx = baseStrokeWidthPx,
+                color = color
+            )
+        )
+        pendingCommits.add(
+            PendingPressureInkCommit(
+                id = committedGeneration,
+                samples = strokeSamples,
+                baseStrokeWidthPx = baseStrokeWidthPx,
+                color = color,
+                onCommit = onCommit,
+                onCommittedPreviewReadyToClear = inkOverlayController::removeCommittedPreview
+            )
+        )
+        clearActiveStroke(inkOverlayController)
+        schedulePendingCommitsFlush()
     }
 
-    private fun clearCommittedPreview(generation: Int) {
-        committedPreviewStrokes = committedPreviewStrokes
-            .filterNot { it.id == generation }
+    private fun postponePendingCommits() {
+        pendingCommitHandler.removeCallbacks(flushPendingCommitsRunnable)
+    }
+
+    private fun schedulePendingCommitsFlush() {
+        pendingCommitHandler.removeCallbacks(flushPendingCommitsRunnable)
+        pendingCommitHandler.postDelayed(
+            flushPendingCommitsRunnable,
+            INK_COMMIT_IDLE_DELAY_MS
+        )
+    }
+
+    private fun flushPendingCommits() {
+        if (pendingCommits.isEmpty()) {
+            return
+        }
+
+        val commits = pendingCommits.toList()
+        pendingCommits.clear()
+        commits.forEach { commit ->
+            val viewBounds = strokeBounds(
+                samples = commit.samples,
+                baseStrokeWidthPx = commit.baseStrokeWidthPx
+            )
+            val bitmap = renderStrokeBitmap(
+                samples = commit.samples,
+                viewBounds = viewBounds,
+                baseStrokeWidthPx = commit.baseStrokeWidthPx,
+                color = commit.color
+            ) ?: run {
+                commit.onCommittedPreviewReadyToClear(commit.id)
+                return@forEach
+            }
+            commit.onCommit(bitmap, viewBounds) {
+                commit.onCommittedPreviewReadyToClear(commit.id)
+            }
+        }
     }
 
     private fun calculatePrediction(maxPredictionDistance: Float): PressureSample? {
@@ -582,75 +597,57 @@ private class PressureInkStrokeState {
     }
 }
 
-private fun DrawScope.drawPressureStroke(
-    samples: List<PressureSample>,
-    baseStrokeWidthPx: Float,
-    color: Color,
-    pressureProfile: PressureProfile = PressureProfile.from(samples)
-) {
-    drawIntoCanvas { canvas ->
-        drawPressureStroke(
-            canvas = canvas.nativeCanvas,
-            samples = samples,
-            baseStrokeWidthPx = baseStrokeWidthPx,
-            color = color.toArgb(),
-            pressureProfile = pressureProfile
-        )
-    }
-}
-
-private fun DrawScope.drawPredictedPressureStroke(
+private fun drawPredictedPressureStroke(
+    canvas: AndroidCanvas,
     samples: List<PressureSample>,
     predictedSample: PressureSample,
     baseStrokeWidthPx: Float,
-    color: Color,
+    color: Int,
     pressureProfile: PressureProfile
 ) {
     if (samples.isEmpty()) {
         return
     }
 
-    drawIntoCanvas { canvas ->
-        val nativeCanvas = canvas.nativeCanvas
-        val paint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            this.color = color.toArgb()
-            style = AndroidPaint.Style.STROKE
-            strokeCap = AndroidPaint.Cap.ROUND
-            strokeJoin = AndroidPaint.Join.ROUND
-            strokeWidth = strokeWidthForPredictedSample(
-                samples = samples,
-                predictedSample = predictedSample,
-                baseStrokeWidthPx = baseStrokeWidthPx,
-                pressureProfile = pressureProfile
-            )
-        }
-        val current = samples.last()
-        if (samples.size < 2) {
-            nativeCanvas.drawLine(
-                current.point.x,
-                current.point.y,
-                predictedSample.point.x,
-                predictedSample.point.y,
-                paint
-            )
-            return@drawIntoCanvas
-        }
-
-        val previous = samples[samples.lastIndex - 1]
-        val tangent = current.point - previous.point
-        val path = AndroidPath().apply {
-            moveTo(current.point.x, current.point.y)
-            cubicTo(
-                current.point.x + tangent.x * PREDICTION_CONTROL_TENSION,
-                current.point.y + tangent.y * PREDICTION_CONTROL_TENSION,
-                predictedSample.point.x - tangent.x * PREDICTION_END_TENSION,
-                predictedSample.point.y - tangent.y * PREDICTION_END_TENSION,
-                predictedSample.point.x,
-                predictedSample.point.y
-            )
-        }
-        nativeCanvas.drawPath(path, paint)
+    val paint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        this.color = color
+        alpha = PREDICTION_ALPHA
+        style = AndroidPaint.Style.STROKE
+        strokeCap = AndroidPaint.Cap.ROUND
+        strokeJoin = AndroidPaint.Join.ROUND
+        strokeWidth = strokeWidthForPredictedSample(
+            samples = samples,
+            predictedSample = predictedSample,
+            baseStrokeWidthPx = baseStrokeWidthPx,
+            pressureProfile = pressureProfile
+        )
     }
+    val current = samples.last()
+    if (samples.size < 2) {
+        canvas.drawLine(
+            current.point.x,
+            current.point.y,
+            predictedSample.point.x,
+            predictedSample.point.y,
+            paint
+        )
+        return
+    }
+
+    val previous = samples[samples.lastIndex - 1]
+    val tangent = current.point - previous.point
+    val path = AndroidPath().apply {
+        moveTo(current.point.x, current.point.y)
+        cubicTo(
+            current.point.x + tangent.x * PREDICTION_CONTROL_TENSION,
+            current.point.y + tangent.y * PREDICTION_CONTROL_TENSION,
+            predictedSample.point.x - tangent.x * PREDICTION_END_TENSION,
+            predictedSample.point.y - tangent.y * PREDICTION_END_TENSION,
+            predictedSample.point.x,
+            predictedSample.point.y
+        )
+    }
+    canvas.drawPath(path, paint)
 }
 
 private fun strokeBounds(samples: List<PressureSample>, baseStrokeWidthPx: Float): RectF {
@@ -870,19 +867,300 @@ private fun midpoint(first: Offset, second: Offset): Offset {
     )
 }
 
-private data class PressureSample(
+internal data class PressureSample(
     val point: Offset,
     val eventTime: Long,
     val pressure: Float,
 )
 
-private data class CommittedPressureStroke(
+internal data class CommittedPressureStroke(
     val id: Int,
     val samples: List<PressureSample>,
     val pressureProfile: PressureProfile,
+    val baseStrokeWidthPx: Float,
+    val color: Int,
 )
 
-private data class PressureProfile(
+private data class PendingPressureInkCommit(
+    val id: Int,
+    val samples: List<PressureSample>,
+    val baseStrokeWidthPx: Float,
+    val color: Int,
+    val onCommit: (Bitmap, RectF, () -> Unit) -> Unit,
+    val onCommittedPreviewReadyToClear: (Int) -> Unit,
+)
+
+internal class PressureInkOverlayController {
+    private var view: PressureInkOverlayView? = null
+
+    fun attach(view: PressureInkOverlayView) {
+        this.view = view
+    }
+
+    fun detach(view: PressureInkOverlayView) {
+        if (this.view === view) {
+            this.view = null
+        }
+    }
+
+    fun setLiveStroke(
+        samples: List<PressureSample>,
+        pressureProfile: PressureProfile,
+        predictedSample: PressureSample?,
+        baseStrokeWidthPx: Float,
+        color: Int
+    ) {
+        view?.setLiveStroke(
+            samples = samples,
+            pressureProfile = pressureProfile,
+            predictedSample = predictedSample,
+            baseStrokeWidthPx = baseStrokeWidthPx,
+            color = color
+        )
+    }
+
+    fun clearLiveStroke() {
+        view?.clearLiveStroke()
+    }
+
+    fun addCommittedPreview(stroke: CommittedPressureStroke) {
+        view?.addCommittedPreview(stroke)
+    }
+
+    fun removeCommittedPreview(id: Int) {
+        view?.removeCommittedPreview(id)
+    }
+
+    fun clear() {
+        view?.clear()
+    }
+}
+
+internal class PressureInkOverlayView(context: Context) : View(context) {
+    private var liveSamples: List<PressureSample> = emptyList()
+    private var livePressureProfile: PressureProfile = PressureProfile.empty()
+    private var livePredictedSample: PressureSample? = null
+    private var liveBaseStrokeWidthPx: Float = 0f
+    private var liveColor: Int = AndroidColor.BLACK
+    private var liveBitmap: Bitmap? = null
+    private var liveBitmapCanvas: AndroidCanvas? = null
+    private var renderedLiveSampleCount = 0
+    private var renderedLiveStrokeStartTime: Long? = null
+    private var committedPreviewStrokes: List<CommittedPressureStroke> = emptyList()
+
+    init {
+        setWillNotDraw(false)
+        isClickable = false
+        isFocusable = false
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+
+    fun setLiveStroke(
+        samples: List<PressureSample>,
+        pressureProfile: PressureProfile,
+        predictedSample: PressureSample?,
+        baseStrokeWidthPx: Float,
+        color: Int
+    ) {
+        val previousPredictedSample = livePredictedSample
+        liveSamples = samples
+        livePressureProfile = pressureProfile
+        livePredictedSample = predictedSample
+        liveBaseStrokeWidthPx = baseStrokeWidthPx
+        liveColor = color
+        val dirtyBounds = renderLiveStrokeIncrementally(
+            samples = samples,
+            pressureProfile = pressureProfile,
+            baseStrokeWidthPx = baseStrokeWidthPx,
+            color = color
+        )
+        invalidateStrokeBounds(dirtyBounds, previousPredictedSample, predictedSample)
+    }
+
+    fun clearLiveStroke() {
+        if (liveSamples.isEmpty() && livePredictedSample == null) {
+            return
+        }
+        liveSamples = emptyList()
+        livePressureProfile = PressureProfile.empty()
+        livePredictedSample = null
+        clearLiveBitmap()
+        postInvalidateOnAnimation()
+    }
+
+    fun addCommittedPreview(stroke: CommittedPressureStroke) {
+        committedPreviewStrokes = committedPreviewStrokes + stroke
+        postInvalidateOnAnimation()
+    }
+
+    fun removeCommittedPreview(id: Int) {
+        val updatedStrokes = committedPreviewStrokes.filterNot { it.id == id }
+        if (updatedStrokes.size == committedPreviewStrokes.size) {
+            return
+        }
+        committedPreviewStrokes = updatedStrokes
+        postInvalidateOnAnimation()
+    }
+
+    fun clear() {
+        liveSamples = emptyList()
+        livePressureProfile = PressureProfile.empty()
+        livePredictedSample = null
+        clearLiveBitmap()
+        committedPreviewStrokes = emptyList()
+        postInvalidateOnAnimation()
+    }
+
+    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
+        super.onSizeChanged(width, height, oldWidth, oldHeight)
+        clearLiveBitmap()
+        if (liveSamples.isNotEmpty()) {
+            renderLiveStrokeIncrementally(
+                samples = liveSamples,
+                pressureProfile = livePressureProfile,
+                baseStrokeWidthPx = liveBaseStrokeWidthPx,
+                color = liveColor
+            )
+        }
+    }
+
+    override fun onDraw(canvas: AndroidCanvas) {
+        super.onDraw(canvas)
+
+        committedPreviewStrokes.forEach { previewStroke ->
+            drawPressureStroke(
+                canvas = canvas,
+                samples = previewStroke.samples,
+                baseStrokeWidthPx = previewStroke.baseStrokeWidthPx,
+                color = previewStroke.color,
+                pressureProfile = previewStroke.pressureProfile
+            )
+        }
+
+        if (liveSamples.isEmpty()) {
+            return
+        }
+
+        liveBitmap?.let { bitmap ->
+            canvas.drawBitmap(bitmap, 0f, 0f, null)
+        } ?: drawPressureStroke(
+            canvas = canvas,
+            samples = liveSamples,
+            baseStrokeWidthPx = liveBaseStrokeWidthPx,
+            color = liveColor,
+            pressureProfile = livePressureProfile
+        )
+        livePredictedSample?.let { predictedSample ->
+            drawPredictedPressureStroke(
+                canvas = canvas,
+                samples = liveSamples,
+                predictedSample = predictedSample,
+                baseStrokeWidthPx = liveBaseStrokeWidthPx,
+                color = liveColor,
+                pressureProfile = livePressureProfile
+            )
+        }
+    }
+
+    private fun renderLiveStrokeIncrementally(
+        samples: List<PressureSample>,
+        pressureProfile: PressureProfile,
+        baseStrokeWidthPx: Float,
+        color: Int
+    ): RectF? {
+        if (samples.isEmpty() || width <= 0 || height <= 0) {
+            return null
+        }
+
+        ensureLiveBitmap()
+        val canvas = liveBitmapCanvas ?: return null
+        val strokeStartTime = samples.first().eventTime
+        if (
+            renderedLiveStrokeStartTime != strokeStartTime ||
+            samples.size < renderedLiveSampleCount ||
+            liveBitmap == null
+        ) {
+            liveBitmap?.eraseColor(AndroidColor.TRANSPARENT)
+            renderedLiveSampleCount = 0
+            renderedLiveStrokeStartTime = strokeStartTime
+        }
+
+        val startIndex = if (renderedLiveSampleCount == 0) {
+            0
+        } else {
+            (renderedLiveSampleCount - 2).coerceAtLeast(0)
+        }
+        val samplesToRender = samples.subList(startIndex, samples.size)
+        if (samplesToRender.isEmpty()) {
+            return null
+        }
+
+        drawPressureStroke(
+            canvas = canvas,
+            samples = samplesToRender,
+            baseStrokeWidthPx = baseStrokeWidthPx,
+            color = color,
+            pressureProfile = pressureProfile
+        )
+        renderedLiveSampleCount = samples.size
+        renderedLiveStrokeStartTime = strokeStartTime
+        return strokeBounds(samplesToRender, baseStrokeWidthPx)
+    }
+
+    private fun ensureLiveBitmap() {
+        val existingBitmap = liveBitmap
+        if (existingBitmap != null &&
+            existingBitmap.width == width &&
+            existingBitmap.height == height
+        ) {
+            return
+        }
+        if (width <= 0 || height <= 0) {
+            return
+        }
+        liveBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        liveBitmapCanvas = AndroidCanvas(liveBitmap!!)
+        renderedLiveSampleCount = 0
+        renderedLiveStrokeStartTime = null
+    }
+
+    private fun clearLiveBitmap() {
+        liveBitmap?.eraseColor(AndroidColor.TRANSPARENT)
+        renderedLiveSampleCount = 0
+        renderedLiveStrokeStartTime = null
+    }
+
+    private fun invalidateStrokeBounds(
+        dirtyBounds: RectF?,
+        previousPredictedSample: PressureSample?,
+        predictedSample: PressureSample?
+    ) {
+        val bounds = dirtyBounds?.let { RectF(it) } ?: RectF()
+        previousPredictedSample?.expandToInclude(bounds)
+        predictedSample?.expandToInclude(bounds)
+        if (bounds.isEmpty) {
+            postInvalidateOnAnimation()
+            return
+        }
+        val padding = (liveBaseStrokeWidthPx * 4f + BITMAP_STROKE_PADDING_PX).toInt()
+        postInvalidateOnAnimation(
+            bounds.left.toInt() - padding,
+            bounds.top.toInt() - padding,
+            bounds.right.toInt() + padding,
+            bounds.bottom.toInt() + padding
+        )
+    }
+
+    private fun PressureSample.expandToInclude(bounds: RectF) {
+        if (bounds.isEmpty) {
+            bounds.set(point.x, point.y, point.x, point.y)
+            return
+        }
+        bounds.union(point.x, point.y)
+    }
+}
+
+internal data class PressureProfile(
     private val minPressure: Float,
     private val maxPressure: Float,
     private val minSpeedPxPerMs: Float,
@@ -1023,5 +1301,7 @@ private const val MAX_SPEED_PSEUDO_PRESSURE = 0.96f
 private const val DEFAULT_SPEED_PSEUDO_PRESSURE = 0.62f
 private const val SPEED_INFLUENCE_WITH_REAL_PRESSURE = 0.22f
 private const val SPEED_INFLUENCE_WITH_FLAT_PRESSURE = 0.52f
+private const val INK_COMMIT_IDLE_DELAY_MS = 1200L
+private const val PREDICTION_ALPHA = 97
 private const val PREDICTION_CONTROL_TENSION = 0.55f
 private const val PREDICTION_END_TENSION = 0.18f

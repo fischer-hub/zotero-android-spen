@@ -50,6 +50,7 @@ import org.zotero.android.pdfworker.PdfWorkerController
 import org.zotero.android.screens.retrievemetadata.data.RetrieveMetadataState
 import org.zotero.android.screens.share.data.CollectionPickerState
 import org.zotero.android.screens.share.data.ItemPickerState
+import org.zotero.android.screens.share.data.PdfReplacementTarget
 import org.zotero.android.screens.share.data.ProcessedAttachment
 import org.zotero.android.screens.share.data.RecentData
 import org.zotero.android.screens.share.data.UploadData
@@ -141,6 +142,9 @@ internal class ShareViewModel @Inject constructor(
         selectedCollectionId = fileStore.getSelectedCollectionId()
         selectedLibraryId = fileStore.getSelectedLibrary()
         attachmentKey = KeyGenerator.newKey()
+        updateState {
+            copy(pdfReplacementTarget = defaults.getLastPdfReplacementTarget())
+        }
         setupObservers()
         ioCoroutineScope.launch {
             try {
@@ -703,6 +707,16 @@ internal class ShareViewModel @Inject constructor(
         val tmpFile = fileStore.temporaryFile(fileExtension)
         try {
             getUriDetailsUseCase.copyFile(uri, tmpFile)
+            if (!fileStore.isPdf(tmpFile)) {
+                tmpFile.delete()
+                reportFileIsNotPdf()
+                viewModelScope.launch {
+                    updateState {
+                        copy(attachmentState = AttachmentState.failed(AttachmentState.Error.downloadedFileNotPdf))
+                    }
+                }
+                return
+            }
             viewModelScope.launch {
                 updateState {
                     copy(
@@ -714,7 +728,9 @@ internal class ShareViewModel @Inject constructor(
                         attachmentState = AttachmentState.processed
                     )
                 }
-                attemptToRecognize(tmpFile = tmpFile, fileName = fileName)
+                if (viewState.pdfReplacementTarget == null) {
+                    attemptToRecognize(tmpFile = tmpFile, fileName = fileName)
+                }
             }
 
         } catch (e: Exception) {
@@ -843,6 +859,48 @@ internal class ShareViewModel @Inject constructor(
             submit()
         }
     }
+
+    fun replaceLastOpenedPdfAsync() {
+        val target = viewState.pdfReplacementTarget ?: return
+        val sourceFile = viewState.processedAttachment?.replacementFile ?: return
+        updateState {
+            copy(isSubmitting = true)
+        }
+        ioCoroutineScope.launch {
+            val result = shareItemSubmitter.replaceAttachmentFile(
+                target = target,
+                sourceFile = sourceFile,
+                userId = defaults.getUserId(),
+            )
+            viewModelScope.launch {
+                when (result) {
+                    is CustomResult.GeneralSuccess -> {
+                        triggerEffect(
+                            ShareViewEffect.ShowToastAndNavigateBack(
+                                "PDF replaced. Zotero will sync the updated file."
+                            )
+                        )
+                    }
+                    is CustomResult.GeneralError -> {
+                        Timber.e("ShareViewModel: could not replace last opened PDF")
+                        updateState {
+                            copy(isSubmitting = false)
+                        }
+                        triggerEffect(ShareViewEffect.ShowToast("Could not replace the PDF."))
+                    }
+                }
+            }
+        }
+    }
+
+    private val ProcessedAttachment.replacementFile: File?
+        get() {
+            return when (this) {
+                is ProcessedAttachment.file -> file
+                is ProcessedAttachment.itemWithAttachment -> attachmentFile
+                is ProcessedAttachment.item -> null
+            }
+        }
 
     private suspend fun submit() {
         if (!viewState.attachmentState.isSubmittable) {
@@ -1198,10 +1256,13 @@ internal data class ShareViewState(
     val tags: ImmutableList<Tag> = persistentListOf(),
     val isSubmitting: Boolean = false,
     val retrieveMetadataState: RetrieveMetadataState = RetrieveMetadataState.loading,
+    val pdfReplacementTarget: PdfReplacementTarget? = null,
 ) : ViewState
 
 internal sealed class ShareViewEffect : ViewEffect {
     object NavigateBack : ShareViewEffect()
     object NavigateToTagPickerScreen: ShareViewEffect()
     object NavigateToCollectionPickerScreen: ShareViewEffect()
+    data class ShowToast(val message: String): ShareViewEffect()
+    data class ShowToastAndNavigateBack(val message: String): ShareViewEffect()
 }

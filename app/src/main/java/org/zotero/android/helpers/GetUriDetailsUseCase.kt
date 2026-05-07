@@ -21,29 +21,44 @@ class GetUriDetailsUseCase @Inject constructor(
 ) {
     @SuppressLint("Range")
     fun getFullName(uri: Uri): String? {
-        application.contentResolver.query(
-            uri,
-            null,
-            null,
-            null,
-            null
-        ).use { cursor ->
-            if (cursor != null && cursor.moveToFirst()) {
-                return cursor.getString(cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME))
+        try {
+            application.contentResolver.query(
+                uri,
+                null,
+                null,
+                null,
+                null
+            ).use { cursor ->
+                if (cursor != null && cursor.moveToFirst()) {
+                    return cursor.getString(cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME))
+                }
             }
+        } catch (e: Exception) {
+            Timber.w(e, "GetUriDetailsUseCase: can't query display name for shared URI")
         }
-        return null
+        return inferFileName(uri)
     }
 
     fun getExtension(uri: Uri): String? {
-        val extension: String?
-        if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
-            val mime = MimeTypeMap.getSingleton()
-            extension = mime.getExtensionFromMimeType(application.contentResolver.getType(uri))
-        } else {
-            extension = MimeTypeMap.getFileExtensionFromUrl(Uri.fromFile(File(uri.path!!)).toString())
+        try {
+            val extension: String?
+            if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+                val mime = MimeTypeMap.getSingleton()
+                extension = mime.getExtensionFromMimeType(application.contentResolver.getType(uri))
+            } else {
+                extension = MimeTypeMap.getFileExtensionFromUrl(Uri.fromFile(File(uri.path!!)).toString())
+            }
+            if (!extension.isNullOrEmpty()) {
+                return extension
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "GetUriDetailsUseCase: can't query extension for shared URI")
         }
-        return extension
+        val inferredFileName = inferFileName(uri)
+        val inferredExtension = inferredFileName
+            ?.substringAfterLast('.', missingDelimiterValue = "")
+            ?.takeIf { it.isNotEmpty() && it != inferredFileName }
+        return inferredExtension ?: "pdf"
     }
 
     suspend fun getMimeType(uri: String): MimeType? = withContext(dispatcher) {
@@ -62,5 +77,13 @@ class GetUriDetailsUseCase @Inject constructor(
             Timber.e(error, "GetUriDetailsUseCase: can't copy file")
             throw AttachmentState.Error.fileMissing
         }
+    }
+
+    private fun inferFileName(uri: Uri): String? {
+        val lastSegment = uri.lastPathSegment ?: return null
+        val name = lastSegment
+            .substringAfterLast('/')
+            .substringAfterLast(':')
+        return name.takeIf { it.isNotBlank() }
     }
 }

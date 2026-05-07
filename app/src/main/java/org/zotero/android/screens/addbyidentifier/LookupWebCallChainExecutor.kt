@@ -162,12 +162,19 @@ class LookupWebCallChainExecutor(
 
     private fun onLookupHtmlLoaded() {
         webViewExecutorScope.launch {
-            val loadBundleResult = loadBundleFiles()
-            sendInitSchemaAndDateFormatsMessage(loadBundleResult.first, loadBundleResult.second)
-            val translatorsResult =
-                translatorsAndStylesLoader.translators(null)
-            sendInitTranslatorsMessage(translatorsResult)
-            translatorLoadedEventStream.emitAsync(true)
+            try {
+                val loadBundleResult = loadBundleFiles()
+                sendInitSchemaAndDateFormatsMessage(loadBundleResult.first, loadBundleResult.second)
+                val translatorsResult =
+                    translatorsAndStylesLoader.translators(null)
+                sendInitTranslatorsMessage(translatorsResult)
+                translatorLoadedEventStream.emitAsync(true)
+            } catch (e: Exception) {
+                Timber.e(e, "LookupWebCallChainExecutor: could not load translator bundle")
+                isLoading = InitializationResult.failed(e)
+                translatorLoadedEventStream.emitAsync(false)
+                observable.emitAsync(Result.Failure(LookupError.lookupFailed))
+            }
         }
     }
 

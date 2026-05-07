@@ -5,6 +5,7 @@ import android.content.res.Resources
 import android.util.TypedValue
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.activity.compose.LocalActivity
 import androidx.appcompat.app.AppCompatActivity
@@ -20,8 +21,9 @@ import org.zotero.android.architecture.ui.CustomLayoutSize
 import timber.log.Timber
 
 @Composable
-fun PdfReaderPspdfKitView(
+internal fun PdfReaderPspdfKitView(
     vMInterface: PdfReaderVMInterface,
+    inkOverlayController: PressureInkOverlayController,
     onMotionEvent: (MotionEvent) -> Boolean = { false },
     onKeyEvent: (KeyEvent) -> Boolean = { false },
 ) {
@@ -46,7 +48,24 @@ fun PdfReaderPspdfKitView(
             val fragmentContainerView = FragmentContainerView(context).apply {
                 id = containerId
             }
-            frameLayout.addView(fragmentContainerView)
+            frameLayout.addView(
+                fragmentContainerView,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            )
+
+            val inkOverlayView = PressureInkOverlayView(context)
+            frameLayout.inkOverlayView = inkOverlayView
+            inkOverlayController.attach(inkOverlayView)
+            frameLayout.addView(
+                inkOverlayView,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            )
 
             vMInterface.init(
                 isTablet = layoutType.isTablet(),
@@ -60,6 +79,9 @@ fun PdfReaderPspdfKitView(
         update = { view ->
             view.onMotionEvent = onMotionEvent
             view.onKeyEvent = onKeyEvent
+        },
+        onRelease = { view ->
+            view.inkOverlayView?.let { inkOverlayController.detach(it) }
         }
     )
 }
@@ -67,6 +89,7 @@ fun PdfReaderPspdfKitView(
 private class MotionObservingFrameLayout(context: Context) : FrameLayout(context) {
     var onMotionEvent: (MotionEvent) -> Boolean = { false }
     var onKeyEvent: (KeyEvent) -> Boolean = { false }
+    var inkOverlayView: PressureInkOverlayView? = null
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (onKeyEvent(event)) {

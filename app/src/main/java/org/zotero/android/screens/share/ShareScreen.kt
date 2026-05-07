@@ -1,8 +1,11 @@
 package org.zotero.android.screens.share
 
+import android.widget.Toast
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -10,6 +13,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.livedata.observeAsState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import org.zotero.android.screens.retrievemetadata.data.RetrieveMetadataState
@@ -22,7 +26,9 @@ import org.zotero.android.screens.share.sections.ShareCollectionsSection
 import org.zotero.android.screens.share.sections.ShareParsedItemSection
 import org.zotero.android.screens.share.sections.ShareRecognizeItemSection
 import org.zotero.android.screens.share.sections.ShareTagsSection
+import org.zotero.android.screens.share.data.ProcessedAttachment
 import org.zotero.android.uicomponents.CustomScaffoldM3
+import org.zotero.android.uicomponents.button.SecondaryButton
 import org.zotero.android.uicomponents.themem3.AppThemeM3
 
 @Composable
@@ -35,12 +41,13 @@ internal fun ShareScreen(
     AppThemeM3 {
         val viewState by viewModel.viewStates.observeAsState(ShareViewState())
         val viewEffect by viewModel.viewEffects.observeAsState()
+        val context = LocalContext.current
         LaunchedEffect(key1 = viewModel) {
             viewModel.init()
         }
 
         LaunchedEffect(key1 = viewEffect) {
-            when (viewEffect?.consume()) {
+            when (val effect = viewEffect?.consume()) {
                 NavigateBack -> onBack()
                 NavigateToTagPickerScreen -> {
                     navigateToTagPicker()
@@ -48,6 +55,15 @@ internal fun ShareScreen(
 
                 NavigateToCollectionPickerScreen -> {
                     navigateToCollectionPicker()
+                }
+
+                is ShareViewEffect.ShowToast -> {
+                    Toast.makeText(context, effect.message, Toast.LENGTH_LONG).show()
+                }
+
+                is ShareViewEffect.ShowToastAndNavigateBack -> {
+                    Toast.makeText(context, effect.message, Toast.LENGTH_LONG).show()
+                    onBack()
                 }
 
                 null -> Unit
@@ -97,6 +113,24 @@ internal fun ShareScreen(
                 }
 
                 item {
+                    val hasReplaceablePdf = viewState.pdfReplacementTarget != null &&
+                            viewState.attachmentState.isSubmittable &&
+                            viewState.processedAttachment.isPdfFileAttachment()
+                    if (hasReplaceablePdf) {
+                        SecondaryButton(
+                            text = "Replace last opened PDF",
+                            onClick = viewModel::replaceLastOpenedPdfAsync,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 8.dp),
+                            isEnabled = !isSubmitting,
+                            isLoading = isSubmitting,
+                        )
+                        NewSettingsDivider()
+                    }
+                }
+
+                item {
                     ShareCollectionsSection(
                         collectionPickerState = viewState.collectionPickerState,
                         recents = viewState.recents,
@@ -127,5 +161,13 @@ internal fun ShareScreen(
                 }
             }
         }
+    }
+}
+
+private fun ProcessedAttachment?.isPdfFileAttachment(): Boolean {
+    return when (this) {
+        is ProcessedAttachment.file -> file.extension.equals("pdf", ignoreCase = true)
+        is ProcessedAttachment.itemWithAttachment -> attachmentFile.extension.equals("pdf", ignoreCase = true)
+        is ProcessedAttachment.item, null -> false
     }
 }

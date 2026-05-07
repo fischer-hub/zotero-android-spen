@@ -12,20 +12,25 @@ import org.zotero.android.database.requests.CreateAttachmentDbRequest
 import org.zotero.android.database.requests.CreateBackendItemDbRequest
 import org.zotero.android.database.requests.CreateItemWithAttachmentDbRequest
 import org.zotero.android.database.requests.MarkAttachmentUploadedDbRequest
+import org.zotero.android.database.requests.ReadAttachmentReplacementDataDbRequest
+import org.zotero.android.database.requests.StoreAttachmentReplacementFileDbRequest
 import org.zotero.android.database.requests.UpdateCollectionLastUsedDbRequest
 import org.zotero.android.database.requests.key
 import org.zotero.android.files.FileStore
 import org.zotero.android.screens.share.backgroundprocessor.BackgroundUploadProcessor
 import org.zotero.android.screens.share.data.CreateItemsResult
 import org.zotero.android.screens.share.data.CreateResult
+import org.zotero.android.screens.share.data.PdfReplacementTarget
 import org.zotero.android.screens.share.data.UploadData
 import org.zotero.android.screens.share.sharecollectionpicker.data.ShareSubmissionData
 import org.zotero.android.sync.DateParser
 import org.zotero.android.sync.LibraryIdentifier
 import org.zotero.android.sync.SchemaController
+import org.zotero.android.sync.SyncActionError
 import org.zotero.android.sync.SyncObject
 import org.zotero.android.sync.syncactions.AuthorizeUploadSyncAction
 import org.zotero.android.sync.syncactions.SubmitUpdateSyncAction
+import org.zotero.android.sync.syncactions.UploadAttachmentSyncAction
 import org.zotero.android.sync.syncactions.data.AuthorizeUploadResponse
 import org.zotero.android.translator.data.AttachmentState
 import org.zotero.android.webdav.WebDavController
@@ -316,6 +321,88 @@ class ShareItemSubmitter @Inject constructor(
             fromFile.delete()
             throw error
         }
+    }
+
+    suspend fun replaceAttachmentFile(
+        target: PdfReplacementTarget,
+        sourceFile: File,
+        userId: Long,
+    ): CustomResult<Unit> {
+        val libraryId = target.libraryId ?: return CustomResult.GeneralError.CodeError(
+            AttachmentState.Error.fileMissing
+        )
+        if (!fileStore.isPdf(sourceFile)) {
+            return CustomResult.GeneralError.CodeError(AttachmentState.Error.downloadedFileNotPdf)
+        }
+
+        val replacementData = try {
+            dbWrapperMain.realmDbStorage.perform(
+                request = ReadAttachmentReplacementDataDbRequest(
+                    key = target.key,
+                    libraryId = libraryId,
+                ),
+                invalidateRealm = true,
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "ShareItemSubmitter: could not read replacement target")
+            return CustomResult.GeneralError.CodeError(e)
+        }
+
+        val targetFile = fileStore.attachmentFile(
+            libraryId = libraryId,
+            key = target.key,
+            filename = replacementData.filename,
+        )
+        val size = try {
+            if (sourceFile.length() == 0L) {
+                throw AttachmentState.Error.fileMissing
+            }
+            sourceFile.copyTo(targetFile, overwrite = true)
+            targetFile.length()
+        } catch (e: Exception) {
+            Timber.e(e, "ShareItemSubmitter: could not copy replacement PDF")
+            return CustomResult.GeneralError.CodeError(e)
+        }
+        if (size == 0L) {
+            return CustomResult.GeneralError.CodeError(AttachmentState.Error.fileMissing)
+        }
+
+        val md5 = fileStore.md5(targetFile)
+        val mtime = System.currentTimeMillis()
+        try {
+            dbWrapperMain.realmDbStorage.perform(
+                StoreAttachmentReplacementFileDbRequest(
+                    key = target.key,
+                    libraryId = libraryId,
+                    md5 = md5,
+                    mtime = mtime,
+                )
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "ShareItemSubmitter: could not store replacement metadata")
+            return CustomResult.GeneralError.CodeError(e)
+        }
+
+        val result = UploadAttachmentSyncAction(
+            key = target.key,
+            file = targetFile,
+            filename = replacementData.filename,
+            md5 = md5,
+            mtime = mtime,
+            libraryId = libraryId,
+            userId = userId,
+            oldMd5 = replacementData.oldMd5,
+        ).result()
+
+        if (result is CustomResult.GeneralError.CodeError &&
+            result.throwable == SyncActionError.attachmentAlreadyUploaded
+        ) {
+            return CustomResult.GeneralSuccess(Unit)
+        }
+        if (result is CustomResult.GeneralError) {
+            Timber.e("ShareItemSubmitter: replacement PDF stored locally, immediate upload will retry during sync")
+        }
+        return CustomResult.GeneralSuccess(Unit)
     }
 
     suspend fun uploadToZotero(

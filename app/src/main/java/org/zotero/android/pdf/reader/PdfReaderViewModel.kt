@@ -175,6 +175,7 @@ import org.zotero.android.pdf.reader.sidebar.data.ThumbnailsPreviewFileCache
 import org.zotero.android.pdf.settings.data.PdfSettingsArgs
 import org.zotero.android.pdf.settings.data.PdfSettingsChangeResult
 import org.zotero.android.screens.citation.singlecitation.data.SingleCitationArgs
+import org.zotero.android.screens.share.data.PdfReplacementTarget
 import org.zotero.android.screens.tagpicker.data.TagPickerArgs
 import org.zotero.android.screens.tagpicker.data.TagPickerResult
 import org.zotero.android.sync.AnnotationBoundingBoxCalculator
@@ -841,6 +842,13 @@ class PdfReaderViewModel @Inject constructor(
         this.activeEraserSize = defaults.getActiveEraserSize()
         this.activeFontSize = defaults.getActiveFontSize()
         this.initialPage = params.page
+        defaults.setLastPdfReplacementTarget(
+            PdfReplacementTarget.from(
+                key = params.key,
+                libraryId = params.library.identifier,
+                displayName = originalFile.name,
+            )
+        )
 
         updateState {
             copy(

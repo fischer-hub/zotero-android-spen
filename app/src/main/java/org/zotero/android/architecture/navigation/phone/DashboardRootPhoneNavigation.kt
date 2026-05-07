@@ -346,4 +346,3 @@ private fun toAllItems(
 private fun ZoteroNavigation.toScanBarcode() {
     navController.navigate(DashboardRootPhoneDestinations.SCAN_BARCODE)
 }
-

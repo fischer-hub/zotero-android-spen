@@ -63,12 +63,17 @@ class TranslatorWebCallChainExecutor @Inject constructor(
 
     private fun onTranslatorIndexHtmlLoaded() {
         ioCoroutineScope.launch {
-            val loadBundleResult = loadBundleFiles()
-            sendInitSchemaAndDateFormatsMessage(loadBundleResult.first, loadBundleResult.second)
-            val translatorsResult =
-                translatorsAndStylesLoader.translators(this@TranslatorWebCallChainExecutor.url)
-            sendInitTranslatorsMessage(translatorsResult)
-            sendTranslateMessage()
+            try {
+                val loadBundleResult = loadBundleFiles()
+                sendInitSchemaAndDateFormatsMessage(loadBundleResult.first, loadBundleResult.second)
+                val translatorsResult =
+                    translatorsAndStylesLoader.translators(this@TranslatorWebCallChainExecutor.url)
+                sendInitTranslatorsMessage(translatorsResult)
+                sendTranslateMessage()
+            } catch (e: Exception) {
+                Timber.e(e, "TranslatorWebCallChainExecutor: could not load translator bundle")
+                translatorActionEventStream.emitAsync(Result.Failure(TranslationWebViewError.webExtractionMissingJs))
+            }
         }
     }
 
