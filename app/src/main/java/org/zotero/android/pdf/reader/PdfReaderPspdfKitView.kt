@@ -3,6 +3,7 @@ package org.zotero.android.pdf.reader
 import android.content.Context
 import android.content.res.Resources
 import android.util.TypedValue
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.widget.FrameLayout
 import androidx.activity.compose.LocalActivity
@@ -21,7 +22,8 @@ import timber.log.Timber
 @Composable
 fun PdfReaderPspdfKitView(
     vMInterface: PdfReaderVMInterface,
-    onMotionEvent: (MotionEvent) -> Unit = {},
+    onMotionEvent: (MotionEvent) -> Boolean = { false },
+    onKeyEvent: (KeyEvent) -> Boolean = { false },
 ) {
     val activity = LocalActivity.current as? AppCompatActivity ?: return
     val annotationMaxSideSize = annotationMaxSideSize()
@@ -34,6 +36,10 @@ fun PdfReaderPspdfKitView(
         factory = { context ->
             val frameLayout = MotionObservingFrameLayout(context).apply {
                 this.onMotionEvent = onMotionEvent
+                this.onKeyEvent = onKeyEvent
+                isFocusable = true
+                isFocusableInTouchMode = true
+                requestFocus()
             }
 
             val containerId = R.id.container
@@ -53,16 +59,41 @@ fun PdfReaderPspdfKitView(
         },
         update = { view ->
             view.onMotionEvent = onMotionEvent
+            view.onKeyEvent = onKeyEvent
         }
     )
 }
 
 private class MotionObservingFrameLayout(context: Context) : FrameLayout(context) {
-    var onMotionEvent: (MotionEvent) -> Unit = {}
+    var onMotionEvent: (MotionEvent) -> Boolean = { false }
+    var onKeyEvent: (KeyEvent) -> Boolean = { false }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (onKeyEvent(event)) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        onMotionEvent(event)
+        if (onMotionEvent(event)) {
+            return true
+        }
         return super.dispatchTouchEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (onMotionEvent(event)) {
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    override fun dispatchHoverEvent(event: MotionEvent): Boolean {
+        if (onMotionEvent(event)) {
+            return true
+        }
+        return super.dispatchHoverEvent(event)
     }
 }
 

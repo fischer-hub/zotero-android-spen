@@ -1,5 +1,7 @@
 package org.zotero.android.pdf.reader
 
+import android.graphics.Bitmap
+import android.graphics.RectF
 import androidx.compose.ui.graphics.Color
 import androidx.fragment.app.FragmentManager
 import com.pspdfkit.ui.special_mode.controller.AnnotationTool
@@ -33,6 +35,7 @@ interface PdfReaderVMInterface {
     fun onMoreOptionsForItemClicked()
     fun annotation(key: AnnotationKey): PDFAnnotation?
     fun selectAnnotation(key: AnnotationKey)
+    fun addBakedInkStroke(bitmap: Bitmap, viewBounds: RectF, onCommitted: () -> Unit)
     fun loadAnnotationPreviews(keys: List<String>)
     fun showFilterPopup()
     fun toggle(tool: AnnotationTool)

@@ -1,10 +1,13 @@
 package org.zotero.android.pdf.reader
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.PointF
 import android.graphics.RectF
 import android.net.Uri
 import android.os.Handler
+import android.util.Base64
 import android.view.MotionEvent
 import android.view.View
 import androidx.core.net.toUri
@@ -27,6 +30,7 @@ import com.pspdfkit.annotations.HighlightAnnotation
 import com.pspdfkit.annotations.InkAnnotation
 import com.pspdfkit.annotations.NoteAnnotation
 import com.pspdfkit.annotations.SquareAnnotation
+import com.pspdfkit.annotations.StampAnnotation
 import com.pspdfkit.annotations.TextMarkupAnnotation
 import com.pspdfkit.annotations.UnderlineAnnotation
 import com.pspdfkit.annotations.actions.GoToAction
@@ -72,10 +76,12 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.greenrobot.eventbus.EventBus
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
+import org.json.JSONArray
 import org.json.JSONObject
 import org.zotero.android.ZoteroApplication
 import org.zotero.android.androidx.content.copyHtmlToClipboard
@@ -184,6 +190,7 @@ import org.zotero.android.sync.SessionDataEventStream
 import org.zotero.android.sync.Tag
 import org.zotero.android.uicomponents.Strings
 import timber.log.Timber
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.EnumSet
@@ -192,6 +199,27 @@ import javax.inject.Inject
 import javax.inject.Provider
 import kotlin.concurrent.timerTask
 import kotlin.random.Random
+
+private const val BAKED_INK_CUSTOM_DATA_KEY = "bakedInk"
+private const val BAKED_INK_ID_CUSTOM_DATA_KEY = "bakedInkId"
+private const val BAKED_INK_PREVIEW_OVERLAP_MS = 900L
+private const val PDF_VIEW_POSITION_RESTORE_DELAY_MS = 50L
+private const val PDF_VIEW_POSITION_RESTORE_RETRY_DELAY_MS = 120L
+private const val PDF_VIEW_POSITION_RESTORE_ATTEMPTS = 4
+private const val BAKED_INK_SIDE_CAR_VERSION = 1
+private const val BAKED_INK_SIDE_CAR_FILE_NAME = "strokes.json"
+
+private data class PdfViewPositionSnapshot(
+    val pageIndex: Int,
+    val visiblePdfRect: RectF,
+)
+
+private data class BakedInkStrokeRecord(
+    val id: String,
+    val pageIndex: Int,
+    val pdfBounds: RectF,
+    val bitmap: Bitmap,
+)
 
 @HiltViewModel
 class PdfReaderViewModel @Inject constructor(
@@ -270,6 +298,8 @@ class PdfReaderViewModel @Inject constructor(
     private var shouldPreserveFilterResultsBetweenReinitializations = false
 
     private var initialPage: Int? = null
+    private var pendingToolOptionsViewPosition: PdfViewPositionSnapshot? = null
+    private val bakedInkSideCarLock = Any()
 
     @Inject
     lateinit var citationControllerProvider: Provider<CitationController>
@@ -376,13 +406,14 @@ class PdfReaderViewModel @Inject constructor(
 
     @Subscribe(threadMode = ThreadMode.MAIN)
     fun onEvent(result: PdfReaderColorPickerResult) {
-        if (isTablet) {
+        if (canApplyToolOptionsImmediately()) {
             viewModelScope.launch {
                 setToolOptions(
                     hex = result.colorHex,
                     size = result.size,
                     tool = result.annotationTool
                 )
+                queuedUpPdfReaderColorPickerResult = null
             }
         }
     }
@@ -437,7 +468,10 @@ class PdfReaderViewModel @Inject constructor(
         backgroundColor: androidx.compose.ui.graphics.Color,
     ) {
         viewModelScope.launch {
-            initFileUris()
+            val hasExistingPdfUiFragment = this@PdfReaderViewModel::pdfUiFragment.isInitialized
+            val isSameFragmentManager = !this@PdfReaderViewModel::fragmentManager.isInitialized ||
+                    this@PdfReaderViewModel.fragmentManager === fragmentManager
+
             restartDisableForceScreenOnTimer()
             this@PdfReaderViewModel.isTablet = isTablet
             this@PdfReaderViewModel.fragmentManager = fragmentManager
@@ -445,12 +479,21 @@ class PdfReaderViewModel @Inject constructor(
             this@PdfReaderViewModel.annotationMaxSideSize = annotationMaxSideSize
             this@PdfReaderViewModel.backgroundColor = backgroundColor
 
-            searchResultHighlighter = SearchResultHighlighter(context)
-
-            if (this@PdfReaderViewModel::pdfUiFragment.isInitialized) {
+            if (hasExistingPdfUiFragment) {
+                if (
+                    isSameFragmentManager &&
+                    this@PdfReaderViewModel.pdfUiFragment.isAdded &&
+                    !this@PdfReaderViewModel.pdfUiFragment.isRemoving
+                ) {
+                    return@launch
+                }
+                searchResultHighlighter = SearchResultHighlighter(context)
                 replaceFragment()
                 return@launch
             }
+
+            initFileUris()
+            searchResultHighlighter = SearchResultHighlighter(context)
 
             EventBus.getDefault().register(this@PdfReaderViewModel)
 
@@ -943,6 +986,7 @@ class PdfReaderViewModel @Inject constructor(
                     libraryId = library.identifier,
                     isDark = viewState.isDark
                 )
+                restoreBakedInkStrokes()
 
                 val cleanedDbToPdfAnnotations = dbToPdfAnnotations.mapNotNull { triple ->
                     val libraryId = triple.first
@@ -1043,6 +1087,9 @@ class PdfReaderViewModel @Inject constructor(
         onAnnotationUpdatedListener = object :
             AnnotationProvider.OnAnnotationUpdatedListener {
             override fun onAnnotationCreated(annotation: Annotation) {
+                if (isBakedInkStamp(annotation)) {
+                    return
+                }
                 if (isAnnotationZeroSize(annotation)) {
                     Timber.w("PdfReaderViewModel: Prevented an annotation of type ${annotation.type} from being created due to zero dimensions")
                     this@PdfReaderViewModel.document.annotationProvider.removeAnnotationFromPage(
@@ -1055,6 +1102,9 @@ class PdfReaderViewModel @Inject constructor(
             }
 
             override fun onAnnotationUpdated(annotation: Annotation) {
+                if (isBakedInkStamp(annotation)) {
+                    return
+                }
                 processAnnotationObserving(
                     annotation = annotation,
                     changes = emptyList(),
@@ -1065,6 +1115,10 @@ class PdfReaderViewModel @Inject constructor(
             }
 
             override fun onAnnotationRemoved(annotation: Annotation) {
+                if (isBakedInkStamp(annotation)) {
+                    removeBakedInkStroke(annotation)
+                    return
+                }
                 processAnnotationObserving(annotation, emptyList(), PdfReaderNotification.PSPDFAnnotationsRemoved)
             }
 
@@ -2158,6 +2212,240 @@ class PdfReaderViewModel @Inject constructor(
         }
     }
 
+    override fun addBakedInkStroke(
+        bitmap: Bitmap,
+        viewBounds: RectF,
+        onCommitted: () -> Unit
+    ) {
+        if (!::document.isInitialized || !::pdfFragment.isInitialized) {
+            onCommitted()
+            return
+        }
+        if (viewBounds.width() <= 0f || viewBounds.height() <= 0f) {
+            onCommitted()
+            return
+        }
+
+        val pageIndex = pageIndexForViewBounds(viewBounds) ?: run {
+            onCommitted()
+            return
+        }
+        val pdfBounds = RectF(viewBounds)
+        pdfFragment.viewProjection.toPdfRect(pdfBounds, pageIndex)
+        val normalizedPdfBounds = normalizedPdfAnnotationRect(pdfBounds)
+        if (
+            normalizedPdfBounds.right <= normalizedPdfBounds.left ||
+            normalizedPdfBounds.top <= normalizedPdfBounds.bottom
+        ) {
+            onCommitted()
+            return
+        }
+
+        val stampAnnotation = StampAnnotation(pageIndex, normalizedPdfBounds, bitmap).apply {
+            creator = viewState.displayName
+            customData = JSONObject()
+                .put(BAKED_INK_CUSTOM_DATA_KEY, true)
+                .put(BAKED_INK_ID_CUSTOM_DATA_KEY, KeyGenerator.newKey())
+        }
+
+        pdfFragment.addAnnotationToPage(stampAnnotation, false) {
+            storeBakedInkStroke(stampAnnotation, bitmap)
+            thumbnailPreviewManager.store(
+                pageIndex = pageIndex,
+                key = viewState.key,
+                document = this.document,
+                libraryId = viewState.library.identifier,
+                isDark = viewState.isDark,
+            )
+            handler.postDelayed({ onCommitted() }, BAKED_INK_PREVIEW_OVERLAP_MS)
+        }
+    }
+
+    private fun storeBakedInkStroke(annotation: StampAnnotation, bitmap: Bitmap) {
+        val strokeId = bakedInkStrokeId(annotation) ?: return
+        val record = BakedInkStrokeRecord(
+            id = strokeId,
+            pageIndex = annotation.pageIndex,
+            pdfBounds = RectF(annotation.boundingBox),
+            bitmap = bitmap
+        )
+        runBlocking(dispatcher) {
+            storeBakedInkStroke(record)
+        }
+    }
+
+    private fun pageIndexForViewBounds(viewBounds: RectF): Int? {
+        val visiblePages = pdfFragment.visiblePages
+            .takeIf { it.isNotEmpty() }
+            ?: listOf(pdfFragment.pageIndex).filter { it >= 0 }
+        val pageCandidates = visiblePages.filter { it in 0 until document.pageCount }
+
+        val center = PointF(viewBounds.centerX(), viewBounds.centerY())
+        return pageCandidates.firstOrNull { pageIndex ->
+            val pagePoint = PointF(center.x, center.y)
+            pdfFragment.viewProjection.toPdfPoint(pagePoint, pageIndex)
+            val pageSize = document.getPageSize(pageIndex)
+            pagePoint.x >= 0f &&
+                    pagePoint.x <= pageSize.width &&
+                    pagePoint.y >= 0f &&
+                    pagePoint.y <= pageSize.height
+        } ?: pageCandidates.firstOrNull()
+    }
+
+    private fun normalizedPdfAnnotationRect(rect: RectF): RectF {
+        return RectF(
+            minOf(rect.left, rect.right),
+            maxOf(rect.top, rect.bottom),
+            maxOf(rect.left, rect.right),
+            minOf(rect.top, rect.bottom)
+        )
+    }
+
+    private suspend fun restoreBakedInkStrokes() {
+        val records = withContext(dispatcher) {
+            loadBakedInkStrokes()
+        }
+        records.forEach { record ->
+            val annotation = StampAnnotation(record.pageIndex, record.pdfBounds, record.bitmap)
+            annotation.customData = JSONObject()
+                .put(BAKED_INK_CUSTOM_DATA_KEY, true)
+                .put(BAKED_INK_ID_CUSTOM_DATA_KEY, record.id)
+            annotation.creator = viewState.displayName
+            document.annotationProvider.addAnnotationToPage(annotation)
+        }
+    }
+
+    private fun isBakedInkStamp(annotation: Annotation): Boolean {
+        return annotation.type == AnnotationType.STAMP &&
+                annotation.customData?.optBoolean(BAKED_INK_CUSTOM_DATA_KEY) == true
+    }
+
+    private fun bakedInkStrokeId(annotation: Annotation): String? {
+        return annotation.customData
+            ?.optString(BAKED_INK_ID_CUSTOM_DATA_KEY)
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun bakedInkSideCarFile(): File {
+        val folder = File(
+            fileStore.getRootDirectory(),
+            "bakedInk/${viewState.library.identifier.folderName}/${viewState.key}"
+        )
+        folder.mkdirs()
+        return File(folder, BAKED_INK_SIDE_CAR_FILE_NAME)
+    }
+
+    private fun loadBakedInkStrokes(): List<BakedInkStrokeRecord> {
+        synchronized(bakedInkSideCarLock) {
+            val file = bakedInkSideCarFile()
+            if (!file.exists()) {
+                return emptyList()
+            }
+
+            val root = runCatching { JSONObject(file.readText()) }
+                .getOrElse { error ->
+                    Timber.e(error, "PdfReaderViewModel: can't read baked ink sidecar")
+                    return emptyList()
+                }
+            val strokes = root.optJSONArray("strokes") ?: return emptyList()
+            val records = mutableListOf<BakedInkStrokeRecord>()
+            for (index in 0 until strokes.length()) {
+                val json = strokes.optJSONObject(index) ?: continue
+                val bitmapBytes = runCatching {
+                    Base64.decode(json.getString("bitmap"), Base64.NO_WRAP)
+                }.getOrNull() ?: continue
+                val bitmap = BitmapFactory.decodeByteArray(bitmapBytes, 0, bitmapBytes.size)
+                    ?: continue
+                records.add(
+                    BakedInkStrokeRecord(
+                        id = json.optString("id").takeIf { it.isNotBlank() } ?: continue,
+                        pageIndex = json.getInt("pageIndex"),
+                        pdfBounds = RectF(
+                            json.getDouble("left").toFloat(),
+                            json.getDouble("top").toFloat(),
+                            json.getDouble("right").toFloat(),
+                            json.getDouble("bottom").toFloat()
+                        ),
+                        bitmap = bitmap
+                    )
+                )
+            }
+            return records
+        }
+    }
+
+    private fun storeBakedInkStroke(record: BakedInkStrokeRecord) {
+        synchronized(bakedInkSideCarLock) {
+            val file = bakedInkSideCarFile()
+            val root = readBakedInkSideCarRoot(file)
+            val strokes = root.optJSONArray("strokes") ?: JSONArray()
+            val updatedStrokes = JSONArray()
+            for (index in 0 until strokes.length()) {
+                val existing = strokes.optJSONObject(index) ?: continue
+                if (existing.optString("id") != record.id) {
+                    updatedStrokes.put(existing)
+                }
+            }
+            updatedStrokes.put(record.toSideCarJson())
+            root.put("strokes", updatedStrokes)
+            file.writeText(root.toString())
+        }
+    }
+
+    private fun removeBakedInkStroke(annotation: Annotation) {
+        val id = bakedInkStrokeId(annotation) ?: return
+        viewModelScope.launch(dispatcher) {
+            synchronized(bakedInkSideCarLock) {
+                val file = bakedInkSideCarFile()
+                if (!file.exists()) {
+                    return@launch
+                }
+                val root = readBakedInkSideCarRoot(file)
+                val strokes = root.optJSONArray("strokes") ?: return@launch
+                val updatedStrokes = JSONArray()
+                for (index in 0 until strokes.length()) {
+                    val existing = strokes.optJSONObject(index) ?: continue
+                    if (existing.optString("id") != id) {
+                        updatedStrokes.put(existing)
+                    }
+                }
+                if (updatedStrokes.length() == 0) {
+                    file.delete()
+                } else {
+                    root.put("strokes", updatedStrokes)
+                    file.writeText(root.toString())
+                }
+            }
+        }
+    }
+
+    private fun readBakedInkSideCarRoot(file: File): JSONObject {
+        val root = if (file.exists()) {
+            runCatching { JSONObject(file.readText()) }
+                .getOrElse { JSONObject() }
+        } else {
+            JSONObject()
+        }
+        root.put("version", root.optInt("version", BAKED_INK_SIDE_CAR_VERSION))
+        if (!root.has("strokes")) {
+            root.put("strokes", JSONArray())
+        }
+        return root
+    }
+
+    private fun BakedInkStrokeRecord.toSideCarJson(): JSONObject {
+        val outputStream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+        return JSONObject()
+            .put("id", id)
+            .put("pageIndex", pageIndex)
+            .put("left", pdfBounds.left.toDouble())
+            .put("top", pdfBounds.top.toDouble())
+            .put("right", pdfBounds.right.toDouble())
+            .put("bottom", pdfBounds.bottom.toDouble())
+            .put("bitmap", Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP))
+    }
+
 
     fun selectAnnotationFromDocument(key: AnnotationKey) {
         if (!viewState.sidebarEditingEnabled) {
@@ -2514,6 +2802,7 @@ class PdfReaderViewModel @Inject constructor(
 
     override fun showToolOptions() {
         val tool = this.activeAnnotationTool ?: return
+        pendingToolOptionsViewPosition = capturePdfViewPosition()
 
         val colorHex = this.toolColors[tool]
         val size: Float? = when (tool) {
@@ -2610,13 +2899,16 @@ class PdfReaderViewModel @Inject constructor(
 
                     this@PdfReaderViewModel.onDocumentLoaded(document)
 
-                    if (queuedUpPdfReaderColorPickerResult != null) {
+                    val result = queuedUpPdfReaderColorPickerResult
+                    if (result != null) {
                         setToolOptions(
-                            hex = queuedUpPdfReaderColorPickerResult!!.colorHex,
-                            size = queuedUpPdfReaderColorPickerResult!!.size,
-                            tool = queuedUpPdfReaderColorPickerResult!!.annotationTool
+                            hex = result.colorHex,
+                            size = result.size,
+                            tool = result.annotationTool
                         )
                         queuedUpPdfReaderColorPickerResult = null
+                    } else {
+                        restorePendingToolOptionsViewPosition()
                     }
                 }
             }
@@ -2678,7 +2970,9 @@ class PdfReaderViewModel @Inject constructor(
             copy(showCreationToolbar = !viewState.showCreationToolbar)
         }
         if (!viewState.showCreationToolbar) {
-            pdfFragment.exitCurrentlyActiveMode()
+            if (this::pdfFragment.isInitialized) {
+                pdfFragment.exitCurrentlyActiveMode()
+            }
         }
     }
     override fun toggle(tool: AnnotationTool) {
@@ -2687,6 +2981,10 @@ class PdfReaderViewModel @Inject constructor(
     }
 
     fun toggle(annotationTool: AnnotationTool, color: String?) {
+        if (!this::pdfFragment.isInitialized) {
+            return
+        }
+
         val tool = pdfFragment.activeAnnotationTool
 
         if (tool != null && tool != AnnotationTool.ERASER && tool != this.toolHistory.lastOrNull()) {
@@ -2736,8 +3034,13 @@ class PdfReaderViewModel @Inject constructor(
 
     private fun updateAnnotationToolDrawColorAndSize(
         annotationTool: AnnotationTool,
-        drawColor: Int?
+        drawColor: Int?,
+        restoreViewPosition: PdfViewPositionSnapshot? = null,
     ) {
+        if (!this::pdfFragment.isInitialized) {
+            return
+        }
+
         pdfFragment.exitCurrentlyActiveMode()
         when (annotationTool) {
             AnnotationTool.INK -> {
@@ -2771,7 +3074,77 @@ class PdfReaderViewModel @Inject constructor(
             else -> {}
         }
         pdfFragment.enterAnnotationCreationMode(annotationTool)
+        restoreViewPosition?.let { restorePdfViewPosition(it) }
         triggerEffect(PdfReaderViewEffect.ScreenRefresh)
+    }
+
+    private fun canApplyToolOptionsImmediately(): Boolean {
+        return this::pdfUiFragment.isInitialized &&
+                this::pdfFragment.isInitialized &&
+                this::document.isInitialized &&
+                pdfUiFragment.isAdded &&
+                !pdfUiFragment.isRemoving
+    }
+
+    private fun consumePendingToolOptionsViewPosition(): PdfViewPositionSnapshot? {
+        val position = pendingToolOptionsViewPosition
+        pendingToolOptionsViewPosition = null
+        return position
+    }
+
+    private fun restorePendingToolOptionsViewPosition() {
+        consumePendingToolOptionsViewPosition()?.let { restorePdfViewPosition(it) }
+    }
+
+    private fun capturePdfViewPosition(): PdfViewPositionSnapshot? {
+        if (!::pdfFragment.isInitialized || !::document.isInitialized) {
+            return null
+        }
+        val pageCandidates = buildList {
+            val currentPageIndex = pdfUiFragment.pageIndex
+                .takeIf { it in 0 until document.pageCount }
+                ?: pdfFragment.pageIndex.takeIf { it in 0 until document.pageCount }
+            if (currentPageIndex != null) {
+                add(currentPageIndex)
+            }
+            addAll(pdfFragment.visiblePages.filter { it in 0 until document.pageCount })
+        }.distinct()
+
+        for (pageIndex in pageCandidates) {
+            val visiblePdfRect = RectF()
+            if (pdfFragment.getVisiblePdfRect(visiblePdfRect, pageIndex) &&
+                visiblePdfRect.width() > 0f &&
+                visiblePdfRect.height() > 0f
+            ) {
+                return PdfViewPositionSnapshot(
+                    pageIndex = pageIndex,
+                    visiblePdfRect = RectF(visiblePdfRect)
+                )
+            }
+        }
+        return null
+    }
+
+    private fun restorePdfViewPosition(position: PdfViewPositionSnapshot, attempt: Int = 0) {
+        handler.postDelayed(
+            {
+                if (!::pdfFragment.isInitialized || !::document.isInitialized) {
+                    return@postDelayed
+                }
+                if (position.pageIndex !in 0 until document.pageCount) {
+                    return@postDelayed
+                }
+                pdfFragment.zoomTo(RectF(position.visiblePdfRect), position.pageIndex, 0)
+                if (attempt + 1 < PDF_VIEW_POSITION_RESTORE_ATTEMPTS) {
+                    restorePdfViewPosition(position, attempt + 1)
+                }
+            },
+            if (attempt == 0) {
+                PDF_VIEW_POSITION_RESTORE_DELAY_MS
+            } else {
+                PDF_VIEW_POSITION_RESTORE_RETRY_DELAY_MS
+            }
+        )
     }
 
     private fun configureNote(drawColor: Int?) {
@@ -2871,23 +3244,38 @@ class PdfReaderViewModel @Inject constructor(
     }
 
     override val activeAnnotationTool: AnnotationTool? get() {
+        if (!this::pdfFragment.isInitialized) {
+            return null
+        }
         return this.pdfFragment.activeAnnotationTool
     }
 
     override fun canUndo() : Boolean {
+        if (!this::pdfFragment.isInitialized) {
+            return false
+        }
         return this.pdfFragment.undoManager.canUndo()
     }
 
     override fun canRedo() : Boolean {
+        if (!this::pdfFragment.isInitialized) {
+            return false
+        }
         return this.pdfFragment.undoManager.canRedo()
     }
 
     override fun onUndoClick() {
+        if (!this::pdfFragment.isInitialized) {
+            return
+        }
         this.pdfFragment.undoManager.undo()
         triggerEffect(PdfReaderViewEffect.ScreenRefresh)
     }
 
     override fun onRedoClick() {
+        if (!this::pdfFragment.isInitialized) {
+            return
+        }
         this.pdfFragment.undoManager.redo()
         triggerEffect(PdfReaderViewEffect.ScreenRefresh)
     }
@@ -3123,6 +3511,8 @@ class PdfReaderViewModel @Inject constructor(
     }
 
     private fun setToolOptions(hex: String?, size: Float?, tool: AnnotationTool) {
+        val restoreViewPosition = consumePendingToolOptionsViewPosition() ?: capturePdfViewPosition()
+
         if (hex != null) {
             when (tool) {
                 AnnotationTool.HIGHLIGHT -> {
@@ -3208,7 +3598,11 @@ class PdfReaderViewModel @Inject constructor(
             )
             drawColor = _color
         }
-        updateAnnotationToolDrawColorAndSize(tool, drawColor = drawColor)
+        updateAnnotationToolDrawColorAndSize(
+            annotationTool = tool,
+            drawColor = drawColor,
+            restoreViewPosition = restoreViewPosition
+        )
     }
 
     override fun onCommentTextChange(annotationKey: String, comment: String) {
